@@ -1,0 +1,7 @@
+pdfplumber
+langchain
+sentence-transformers
+faiss-cpu
+scikit-learn
+numpy
+Pillow
