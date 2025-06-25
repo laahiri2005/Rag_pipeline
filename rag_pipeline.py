@@ -1,5 +1,3 @@
-
-
 import pdfplumber
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
@@ -9,6 +7,8 @@ import numpy as np
 import pickle
 from PIL import Image
 import io
+
+!pip install -U sentence-transformers
 from huggingface_hub import login
 
 # Login using your HF token (get it from https://huggingface.co/settings/tokens)
@@ -36,14 +36,11 @@ def load_pdf_text_with_metadata(file_path):
     return page_data
 
 # === STEP 2: Chunk Text and Track Bounding Boxes ===
-def chunk_text_with_metadata(page_data, chunk_size=500, chunk_overlap=50):
+def chunk_text_with_metadata(page_data, chunk_size=800, chunk_overlap=100):
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
-        separators=["
-
-", "
-", ".", " "]
+        separators=["\n\n", "\n", ".", " "]
     )
 
     all_chunks = []
@@ -89,7 +86,13 @@ def chunk_text_with_metadata(page_data, chunk_size=500, chunk_overlap=50):
 
     return all_chunks
 
-# === STEP 3: Embed and Index Chunks ===
+!rm -r ~/.cache/huggingface/hub/models--sentence-transformers--paraphrase-mpnet-base-v2
+
+import faiss
+from sentence_transformers import SentenceTransformer
+from sklearn.preprocessing import normalize
+import pickle
+
 def embed_and_index_chunks(chunks_with_meta, model_name="paraphrase-mpnet-base-v2"):
     model = SentenceTransformer(model_name)
     texts = [chunk["content"] for chunk in chunks_with_meta]
@@ -99,6 +102,7 @@ def embed_and_index_chunks(chunks_with_meta, model_name="paraphrase-mpnet-base-v
     index = faiss.IndexFlatIP(embeddings.shape[1])
     index.add(embeddings)
 
+    # Save for later use (optional)
     with open("SOP.pkl", "wb") as f:
         pickle.dump({
             "chunks": chunks_with_meta,
@@ -107,15 +111,14 @@ def embed_and_index_chunks(chunks_with_meta, model_name="paraphrase-mpnet-base-v
 
     return model, index, chunks_with_meta
 
-# === STEP 4: Search Function with BBox Info ===
 def search(query, model, index, chunks_with_meta, top_k=3, min_score=0.3, show_image=False):
     query_vec = model.encode([query])
     query_vec = normalize(query_vec, axis=1).astype("float32")
     scores, indices = index.search(query_vec, top_k)
 
-    print(f"
-🔍 Top {top_k} results for: '{query}'
-")
+    retrieved_chunks = []
+
+    print(f"\n🔍 Top {top_k} results for: '{query}'\n")
     for rank, (score, idx) in enumerate(zip(scores[0], indices[0])):
         if score < min_score:
             print(f"🔸 Rank {rank+1}: Skipped (Low Score: {score:.2f})")
@@ -125,27 +128,102 @@ def search(query, model, index, chunks_with_meta, top_k=3, min_score=0.3, show_i
         metadata = chunk["metadata"]
         print(f"🔹 Rank {rank+1} (Score: {score:.2f}) | Page {metadata['page_num']} | Chunk {metadata['chunk_index']}")
         print(f"📍 Char Range: {metadata['char_range']} | 📦 BBox: {metadata['bbox']}")
-        print(f"{chunk['content'][:700]}...
-")
+        print(f"{chunk['content'][:700]}...\n")
+        retrieved_chunks.append(chunk["content"])
 
-        # Optional: display or save image with bbox overlay
+    return retrieved_chunks  # For use in final answer generator
+
+!pip install -U transformers
+
+# === ADDITIONAL IMPORTS ===
+from transformers import pipeline
+
+# === INITIALIZE TinyLlama PIPELINE ===
+tiny_llama = pipeline("text-generation", model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+!pip install -U transformers
+from huggingface_hub import login
+login(new_session=False)
+
+# Load model directly
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+tokenizer = AutoTokenizer.from_pretrained("google/gemma-2b-it")
+model = AutoModelForCausalLM.from_pretrained("google/gemma-2b-it")
+
+# === STEP 4: Modified Search with LLM Summarization ===
+def search(query, model, index, chunks_with_meta, top_k=3, min_score=0.3, show_image=False):
+    from PIL import ImageDraw
+
+    query_vec = model.encode([query])
+    query_vec = normalize(query_vec, axis=1).astype("float32")
+    scores, indices = index.search(query_vec, top_k)
+
+    selected_chunks = []
+    print(f"\n🔍 Top {top_k} results for: '{query}'\n")
+    for rank, (score, idx) in enumerate(zip(scores[0], indices[0])):
+        if score < min_score:
+            print(f"🔸 Rank {rank+1}: Skipped (Low Score: {score:.2f})")
+            continue
+
+        chunk = chunks_with_meta[idx]
+        content = chunk.get("content")
+
+        if not content or not isinstance(content, str):
+            print(f"⚠️ Skipped chunk at index {idx} due to missing or invalid content.")
+            continue
+
+        metadata = chunk["metadata"]
+        print(f"🔹 Rank {rank+1} (Score: {score:.2f}) | Page {metadata['page_num']} | Chunk {metadata['chunk_index']}")
+        print(f"📍 Char Range: {metadata['char_range']} | 📦 BBox: {metadata['bbox']}")
+        print(f"{content[:500]}...\n")
+        selected_chunks.append(content)
+
+
         if show_image and metadata["bbox"]:
             img = Image.open(io.BytesIO(metadata["image_bytes"]))
             draw = ImageDraw.Draw(img)
             draw.rectangle(metadata["bbox"], outline="red", width=2)
             img.show()
 
-# === RUN ALL ===
-if __name__ == "_main_":
-    file_path = "SOP1.pdf"
-    page_data = load_pdf_text_with_metadata(file_path)
-    chunks_with_meta = chunk_text_with_metadata(page_data)
-    model, index, chunks_with_meta = embed_and_index_chunks(chunks_with_meta)
+    # 🔥 Combine Query + Chunks into TinyLlama Prompt
+    combined_context = "\n".join(selected_chunks)
+    prompt = f"""You are a helpful assistant. Based on the following context and query, respond only in bullet points in a clean, step-wise format:
 
-    # === Interactive Loop ===
-    while True:
-        user_query = input("❓ Enter your query (or type 'exit' to quit): ")
-        if user_query.lower() == "exit":
-            break
-        search(user_query, model, index, chunks_with_meta, show_image=False)
-        
+Context:
+{combined_context}
+
+Query:
+{query}
+
+Answer in steps:"""
+
+    # 🔥 Call TinyLlama for final summarization
+    # Make sure tiny_llama pipeline is initialized before calling this function
+    result = tiny_llama(prompt, max_new_tokens=300, do_sample=False)[0]["generated_text"]
+
+    # 🔥 Display final result
+    print("\n🧠 Final Answer (Generated by TinyLlama):\n")
+    bullet_output = result.split("Answer in steps:")[-1].strip()
+    print(bullet_output)
+
+from google.colab import files
+
+uploaded_files = files.upload()  # Upload multiple PDFs
+
+all_chunks = []
+for filename in uploaded_files.keys():
+    print(f"📄 Processing: {filename}")
+    page_data = load_pdf_text_with_metadata(filename)
+    chunks_with_meta = chunk_text_with_metadata(page_data)
+    all_chunks.extend(chunks_with_meta)
+
+# === Embed and Index ===
+embedding_model, faiss_index, all_chunks = embed_and_index_chunks(all_chunks)
+
+# === Interactive Loop ===
+while True:
+    user_query = input("❓ Enter your query (or type 'exit' to quit): ")
+    if user_query.lower() == "exit":
+        break
+    search(user_query, embedding_model, faiss_index, all_chunks, show_image=False)
